@@ -36,30 +36,42 @@ class DnsCacheEntry {
 }
 
 /// LRU DNS cache with TTL refresh (curl_fo cf_cache).
+///
+/// Fix 7: uses [LinkedHashMap] semantics via a standard [Map] with
+/// remove-and-reinsert on touch, giving O(1) iteration-order tracking
+/// without a separate list. Dart's built-in [Map] (HashMap) does not preserve
+/// insertion order, so we use [Map] explicitly typed but backed by the default
+/// LinkedHashMap implementation (Dart's Map literal always returns a
+/// LinkedHashMap). Re-inserting on touch keeps the entry at the "newest" end.
 class DnsCache {
   final GrpcFoConfig config;
   final DnsLookupFn? lookup;
+
+  // Fix 7: LinkedHashMap — insertion order = LRU order.
+  // Newest entries at the end; eviction removes from the front (oldest).
   final Map<String, DnsCacheEntry> _entries = {};
-  final List<String> _lruKeys = [];
+
+  // Fix 4: in-flight futures prevent duplicate DNS lookups on cache miss.
+  final Map<String, Future<ResolveView>> _inFlight = {};
 
   DnsCache(this.config, {this.lookup});
 
   String _key(String host, int port) => '$host:$port';
 
-  void _touch(String key) {
-    _lruKeys.remove(key);
-    _lruKeys.insert(0, key);
+  /// Fix 7: O(1) touch via remove + reinsert (preserves LinkedHashMap order).
+  void _touch(String key, DnsCacheEntry entry) {
+    _entries.remove(key);
+    _entries[key] = entry;
   }
 
   void _evictIfNeeded() {
-    while (_entries.length > config.lruCapacity && _lruKeys.isNotEmpty) {
-      final evictKey = _lruKeys.removeLast();
-      _entries.remove(evictKey);
+    while (_entries.length > config.lruCapacity) {
+      // Remove the oldest entry (first key in insertion order).
+      _entries.remove(_entries.keys.first);
     }
   }
 
-  DnsCacheEntry? _find(String host, int port) =>
-      _entries[_key(host, port)];
+  DnsCacheEntry? _find(String host, int port) => _entries[_key(host, port)];
 
   ResolveView _snapshotFromEntry(DnsCacheEntry entry) {
     if (!entry.multiIp && entry.allAddrs.length == 1) {
@@ -93,11 +105,13 @@ class DnsCache {
         'cache hit $host:$port (${entry.allAddrs.length} IP(s), '
         '${entry.ranks.length} ranked)',
       );
-      _touch(key);
+      _touch(key, entry);
       return _snapshotFromEntry(entry);
     }
 
     if (entry != null) {
+      // Stale entry: refresh TTL while serving the current snapshot to
+      // concurrent callers (stale-while-revalidate).
       if (entry.refreshing) {
         return _snapshotFromEntry(entry);
       }
@@ -108,30 +122,43 @@ class DnsCache {
       } finally {
         entry.refreshing = false;
       }
-      _touch(key);
+      _touch(key, entry);
       return _snapshotFromEntry(entry);
     }
 
-    _vlog('cache miss $host:$port — resolving');
-    final fresh = await _populate(host, port);
-    final existing = _find(host, port);
-    if (existing != null) {
-      _touch(key);
-      return _snapshotFromEntry(existing);
+    // Fix 4: thundering-herd guard. If another concurrent call is already
+    // resolving the same host:port, join its future instead of firing a
+    // second DNS lookup.
+    if (_inFlight.containsKey(key)) {
+      _vlog('joining in-flight resolve for $host:$port');
+      return _inFlight[key]!;
     }
 
+    _vlog('cache miss $host:$port — resolving');
+    final future = _resolveFresh(host, port, key);
+    _inFlight[key] = future;
+    try {
+      return await future;
+    } finally {
+      _inFlight.remove(key);
+    }
+  }
+
+  Future<ResolveView> _resolveFresh(String host, int port, String key) async {
+    final fresh = await _populate(host, port);
+    // Another caller may have raced and inserted the entry already.
+    final existing = _find(host, port);
+    if (existing != null) {
+      _touch(key, existing);
+      return _snapshotFromEntry(existing);
+    }
     _entries[key] = fresh;
-    _touch(key);
     _evictIfNeeded();
     return _snapshotFromEntry(fresh);
   }
 
   Future<DnsCacheEntry> _populate(String host, int port) async {
-    final res = await dnsResolve(
-      host,
-      config.defaultTtlSec,
-      lookup: lookup,
-    );
+    final res = await dnsResolve(host, config.defaultTtlSec, lookup: lookup);
     final now = DateTime.now();
     final entry = DnsCacheEntry(
       host: host,
@@ -155,7 +182,8 @@ class DnsCache {
     return entry;
   }
 
-  /// Returns true if full re-probe is required.
+  /// Refreshes address list from DNS. Returns true if a full re-probe is
+  /// required (top ranked IP is gone or entry was never probed).
   Future<bool> _refreshTtl(DnsCacheEntry entry) async {
     final res = await dnsResolve(
       entry.host,
@@ -164,15 +192,15 @@ class DnsCache {
     );
 
     final topIp = entry.ranks.isNotEmpty ? entry.ranks[0].addr : null;
-    final topStillPresent =
-        topIp != null && addrInList(topIp, res.addrs);
+    final topStillPresent = topIp != null && addrInList(topIp, res.addrs);
 
     entry.allAddrs = res.addrs;
     entry.ttlSec = res.ttlSec;
     entry.multiIp = res.addrs.length > 1;
 
     if (!entry.multiIp) {
-      entry.rankCountReset();
+      entry.ranks = [];
+      entry.probed = false;
       return false;
     }
 
@@ -180,6 +208,8 @@ class DnsCache {
       return true;
     }
 
+    // Preserve existing rank order for IPs still in DNS; append new IPs at
+    // lowest priority (matches curl_fo TTL-refresh behaviour).
     final newRanks = <IpRank>[];
     for (final rank in entry.ranks) {
       if (addrInList(rank.addr, res.addrs)) {
@@ -199,9 +229,7 @@ class DnsCache {
     }
 
     final topN = config.topIps;
-    entry.ranks = newRanks.length > topN
-        ? newRanks.sublist(0, topN)
-        : newRanks;
+    entry.ranks = newRanks.length > topN ? newRanks.sublist(0, topN) : newRanks;
     return false;
   }
 
@@ -241,18 +269,11 @@ class DnsCache {
   void invalidate(String host, int port) {
     final key = _key(host, port);
     _entries.remove(key);
-    _lruKeys.remove(key);
+    _inFlight.remove(key);
   }
 
   void clear() {
     _entries.clear();
-    _lruKeys.clear();
-  }
-}
-
-extension on DnsCacheEntry {
-  void rankCountReset() {
-    ranks = [];
-    probed = false;
+    _inFlight.clear();
   }
 }

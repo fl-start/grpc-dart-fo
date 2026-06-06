@@ -13,7 +13,6 @@ import '../socket_transport.dart';
 import 'config.dart';
 import 'connect_race.dart';
 import 'context.dart';
-import 'ip_rank.dart';
 import 'resolve_view.dart';
 
 /// DNS-aware transport connector with curl_fo-style IP failover.
@@ -50,16 +49,28 @@ class FailoverTransportConnector implements ClientTransportConnector {
       throw SocketException('DNS resolution failed for $hostname');
     }
 
+    // Fix 5: call _onConnectSuccess on single-IP path so state is consistent
+    // if DNS later refreshes to multi-IP.
     if (!snap.multiIp) {
-      return _connectToIp(snap.singleIp!);
+      final conn = await _connectToIp(snap.singleIp!);
+      _onConnectSuccess(snap, snap.singleIp!);
+      return conn;
+    }
+
+    // Fix 2: cap and wrap _currentRankIndex so it never stays past the last IP.
+    if (snap.rankCount > 0 && _currentRankIndex >= snap.rankCount) {
+      _currentRankIndex = 0;
     }
 
     if (_hadSuccessfulConnect && !_retriedSameOnReconnect) {
+      // Reconnect policy (curl_fo WS): retry same IP once before advancing.
       _retriedSameOnReconnect = true;
       final ip = _ipAtRank(snap, _currentRankIndex);
       if (ip != null) {
         try {
-          return await _connectToIp(ip);
+          final conn = await _connectToIp(ip);
+          _onConnectSuccess(snap, ip);
+          return conn;
         } catch (e) {
           lastError = e;
           _vlog('reconnect-same $ip failed — trying next ranked IP');
@@ -67,25 +78,31 @@ class FailoverTransportConnector implements ClientTransportConnector {
       }
     } else if (_hadSuccessfulConnect) {
       _retriedSameOnReconnect = false;
-      _currentRankIndex++;
+      _currentRankIndex =
+          snap.rankCount > 0 ? (_currentRankIndex + 1) % snap.rankCount : 0;
       _vlog('reconnect-next — advancing to rank index $_currentRankIndex');
     }
 
+    // Fix 3: track whether cold race was attempted so we don't retry the
+    // same allAddrs again in the ranked loop below.
+    var coldRaceAttempted = false;
     if (snap.rankCount == 0 && config.tcpRace && snap.allCount > 1) {
+      coldRaceAttempted = true;
       try {
         return await _connectColdRace(snap);
       } catch (e) {
         lastError = e;
+        // Cold race exhausted all addresses (winner + siblings). Do not fall
+        // through to another allAddrs retry — re-throw immediately.
+        throw lastError;
       }
     }
 
-    final attempts = _rankedAttempts(snap);
+    final attempts = _rankedAttempts(snap, skipColdAddrs: coldRaceAttempted);
     for (var i = 0; i < attempts.length; i++) {
       final ip = attempts[i];
       try {
-        _vlog(
-          'failover trying $ip (attempt ${i + 1}/${attempts.length})',
-        );
+        _vlog('failover trying $ip (attempt ${i + 1}/${attempts.length})');
         final conn = await _connectToIp(ip);
         _onConnectSuccess(snap, ip);
         return conn;
@@ -118,19 +135,22 @@ class FailoverTransportConnector implements ClientTransportConnector {
       if (race.ranks.isNotEmpty) {
         foContext.commitRanks(hostname, port, race.ranks);
       } else {
-        unawaited(
-          _commitRaceRanksWhenReady(hostname, port, snap.allAddrs, race),
-        );
+        // Background drain to commit real latency ranks once available.
+        unawaited(_awaitAndCommitRaceRanks(hostname, port, race));
       }
       return conn;
     } catch (e) {
+      // Fix 1: destroy the winner socket explicitly on TLS/HTTP2 failure.
       race.winnerSocket?.destroy();
       _socket = null;
-      _vlog('race winner ${race.winnerAddr} failed transport — trying siblings');
+      _vlog(
+        'race winner ${race.winnerAddr} failed transport — trying siblings',
+      );
       Object? lastError = e;
       for (final ip in snap.allAddrs) {
         if (ip == race.winnerAddr) continue;
         try {
+          // Fix 1: _connectToIp handles socket leak internally.
           final conn = await _connectToIp(ip);
           _onConnectSuccess(snap, ip);
           return conn;
@@ -138,48 +158,45 @@ class FailoverTransportConnector implements ClientTransportConnector {
           lastError = err;
         }
       }
-      throw lastError ?? SocketException('TCP race siblings failed for $hostname');
+      throw lastError ??
+          SocketException('TCP race siblings failed for $hostname');
     }
   }
 
-  Future<void> _commitRaceRanksWhenReady(
+  /// Waits for [race.ranks] to be populated by the background drain and
+  /// commits them. Never falls back to fake-latency data — if the drain
+  /// never produces real measurements nothing is committed.
+  Future<void> _awaitAndCommitRaceRanks(
     String host,
     int p,
-    List<String> allAddrs,
     TcpRaceResult race,
   ) async {
-    await Future<void>.delayed(config.connectTimeout);
+    // Poll with increasing backoff until ranks arrive or give up.
+    const maxWait = Duration(seconds: 30);
+    const pollInterval = Duration(milliseconds: 200);
+    final deadline = DateTime.now().add(maxWait);
+    while (race.ranks.isEmpty && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(pollInterval);
+    }
     if (race.ranks.isNotEmpty) {
       foContext.commitRanks(host, p, race.ranks);
-      return;
     }
-    final ranks = await _probeFallbackRanks(allAddrs);
-    if (ranks.isNotEmpty) {
-      foContext.commitRanks(host, p, ranks);
-    }
+    // Fix 9: if ranks are still empty (all probes timed out) we commit
+    // nothing rather than fake-latency data, keeping probed=false so the
+    // next TTL refresh triggers a real re-probe.
   }
 
-  Future<List<IpRank>> _probeFallbackRanks(List<String> addrs) async {
-    // Background rank build if race drain did not finish in time.
-    return buildRanksFromRace(
-      addrs
-          .map(
-            (a) => IpRank(
-              addr: a,
-              bucketMs: config.latencyBucketMs,
-              rawMs: 0,
-            ),
-          )
-          .toList(),
-      config,
-    );
-  }
-
-  List<String> _rankedAttempts(ResolveView snap) {
+  List<String> _rankedAttempts(
+    ResolveView snap, {
+    bool skipColdAddrs = false,
+  }) {
     if (snap.rankCount > 0) {
       final start = _currentRankIndex.clamp(0, snap.rankCount - 1);
       return snap.ranks.skip(start).take(config.topIps).toList();
     }
+    // Fix 3: if cold race was NOT attempted, use allAddrs; otherwise empty
+    // (cold race already tried every address).
+    if (skipColdAddrs) return const [];
     return snap.allAddrs.take(config.topIps).toList();
   }
 
@@ -204,13 +221,23 @@ class FailoverTransportConnector implements ClientTransportConnector {
     _vlog('connected via $ip');
   }
 
+  /// Fix 1: Opens a TCP socket, upgrades to TLS, and wraps as HTTP/2 transport.
+  /// If TLS or HTTP/2 setup fails the raw TCP socket is destroyed before
+  /// re-throwing so no file descriptor is leaked.
   Future<ClientTransportConnection> _connectToIp(String ip) async {
-    _socket = await openTcpSocket(
+    final socket = await openTcpSocket(
       InternetAddress(ip),
       port,
       connectTimeout: options.connectTimeout ?? config.connectTimeout,
     );
-    return connectPinnedSocket(_socket!, hostname, port, options);
+    _socket = socket;
+    try {
+      return await connectPinnedSocket(socket, hostname, port, options);
+    } catch (_) {
+      socket.destroy();
+      _socket = null;
+      rethrow;
+    }
   }
 
   void _vlog(String message) {

@@ -136,12 +136,19 @@ void _sendProxyConnect(
 }
 
 void _waitForProxyResponse(Uint8List chunk, Completer<void> completer) {
+  // Guard: data may arrive after the completer is already resolved (e.g. the
+  // 200-response body bytes arrive as a second chunk).
+  if (completer.isCompleted) return;
   final response = ascii.decode(chunk);
   if (response.startsWith('HTTP/1.1 200')) {
     completer.complete();
   } else {
-    throw TransportException(
-      'Error establishing proxy connection: $response',
+    // Fix 6: use completeError instead of throw so the Future returned by
+    // connectViaProxy actually fails. Throwing synchronously inside a
+    // socket.listen callback propagates to the stream's onError handler but
+    // never resolves the completer, causing a permanent hang.
+    completer.completeError(
+      TransportException('Error establishing proxy connection: $response'),
     );
   }
 }

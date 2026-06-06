@@ -32,6 +32,7 @@ Future<TcpRaceResult?> tcpRace(
 ) async {
   if (addrs.isEmpty) return null;
   if (addrs.length == 1) {
+    // ignore: close_sinks — socket is intentionally transferred to TcpRaceResult.winnerSocket.
     final socket = await _connectOne(addrs[0], port, config.connectTimeout);
     if (socket == null) return null;
     return TcpRaceResult(
@@ -112,6 +113,9 @@ Future<TcpRaceResult?> tcpRace(
   return result;
 }
 
+/// Fix 8: probe remaining addresses in parallel (Future.wait) instead of
+/// sequentially, so that up to 16 addresses each capped at connectTimeout
+/// all resolve together rather than one-by-one.
 Future<void> _drainAndBuildRanks(
   String host,
   int port,
@@ -120,50 +124,41 @@ Future<void> _drainAndBuildRanks(
   GrpcFoConfig config,
   TcpRaceResult winnerResult,
 ) async {
-  final ranks = <IpRank>[
-    IpRank(
-      addr: winnerResult.winnerAddr,
-      bucketMs: roundBucket(winnerResult.winnerRawMs, config.latencyBucketMs),
-      rawMs: winnerResult.winnerRawMs,
-    ),
-  ];
+  // Winner latency is already known.
+  final winnerRank = IpRank(
+    addr: winnerResult.winnerAddr,
+    bucketMs: roundBucket(winnerResult.winnerRawMs, config.latencyBucketMs),
+    rawMs: winnerResult.winnerRawMs,
+  );
 
+  // Collect futures for all non-winner addresses in parallel.
+  final futures = <Future<IpRank?>>[];
   for (final addr in addrs) {
     if (addr == winnerResult.winnerAddr) continue;
     final attempt = pending.firstWhere((a) => a.addr == addr);
     if (attempt.failed) continue;
     if (attempt.socket != null && attempt.rawMs > 0) {
-      ranks.add(
-        IpRank(
-          addr: addr,
-          bucketMs: roundBucket(attempt.rawMs, config.latencyBucketMs),
-          rawMs: attempt.rawMs,
-        ),
-      );
-      continue;
-    }
-    final stopwatch = Stopwatch()..start();
-    try {
-      final socket = await Socket.connect(
-        InternetAddress(addr),
-        port,
-        timeout: config.connectTimeout,
-      );
-      stopwatch.stop();
-      socket.destroy();
-      ranks.add(
-        IpRank(
-          addr: addr,
-          bucketMs: roundBucket(
-            stopwatch.elapsedMilliseconds,
-            config.latencyBucketMs,
+      // Already measured during the race.
+      futures.add(
+        Future.value(
+          IpRank(
+            addr: addr,
+            bucketMs: roundBucket(attempt.rawMs, config.latencyBucketMs),
+            rawMs: attempt.rawMs,
           ),
-          rawMs: stopwatch.elapsedMilliseconds,
         ),
       );
-    } catch (_) {
-      // skip unreachable
+    } else {
+      // In-flight or not-yet-connected: fire a fresh probe connect.
+      futures.add(_probeForRank(addr, port, config));
     }
+  }
+
+  final probeResults = await Future.wait(futures);
+
+  final ranks = <IpRank>[winnerRank];
+  for (final r in probeResults) {
+    if (r != null) ranks.add(r);
   }
 
   ranks.sort((a, b) => a.bucketMs.compareTo(b.bucketMs));
@@ -173,6 +168,31 @@ Future<void> _drainAndBuildRanks(
 
   if (config.verbose && winnerResult.ranks.isNotEmpty) {
     stderr.writeln('grpc_fo: race ranks committed for $host:$port');
+  }
+}
+
+Future<IpRank?> _probeForRank(
+  String addr,
+  int port,
+  GrpcFoConfig config,
+) async {
+  final stopwatch = Stopwatch()..start();
+  try {
+    final socket = await Socket.connect(
+      InternetAddress(addr),
+      port,
+      timeout: config.connectTimeout,
+    );
+    stopwatch.stop();
+    socket.destroy();
+    final rawMs = stopwatch.elapsedMilliseconds;
+    return IpRank(
+      addr: addr,
+      bucketMs: roundBucket(rawMs, config.latencyBucketMs),
+      rawMs: rawMs,
+    );
+  } catch (_) {
+    return null;
   }
 }
 
