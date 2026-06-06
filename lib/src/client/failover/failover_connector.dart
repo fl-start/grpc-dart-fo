@@ -125,12 +125,15 @@ class FailoverTransportConnector implements ClientTransportConnector {
 
     _socket = race.winnerSocket;
     try {
-      final conn = await connectPinnedSocket(
+      final connected = await connectPinnedSocket(
         race.winnerSocket!,
         hostname,
         port,
         options,
       );
+      // Track the final (possibly TLS) socket for done/shutdown.
+      _socket = connected.socket;
+      final conn = connected.connection;
       _onConnectSuccess(snap, race.winnerAddr);
       if (race.ranks.isNotEmpty) {
         foContext.commitRanks(hostname, port, race.ranks);
@@ -163,27 +166,19 @@ class FailoverTransportConnector implements ClientTransportConnector {
     }
   }
 
-  /// Waits for [race.ranks] to be populated by the background drain and
-  /// commits them. Never falls back to fake-latency data — if the drain
-  /// never produces real measurements nothing is committed.
+  /// Awaits the background drain (no polling) and commits the resulting
+  /// ranks. Never commits fake-latency data — if the drain produced no
+  /// measurements nothing is committed, leaving probed=false so the next
+  /// TTL refresh triggers a real re-probe.
   Future<void> _awaitAndCommitRaceRanks(
     String host,
     int p,
     TcpRaceResult race,
   ) async {
-    // Poll with increasing backoff until ranks arrive or give up.
-    const maxWait = Duration(seconds: 30);
-    const pollInterval = Duration(milliseconds: 200);
-    final deadline = DateTime.now().add(maxWait);
-    while (race.ranks.isEmpty && DateTime.now().isBefore(deadline)) {
-      await Future<void>.delayed(pollInterval);
-    }
+    await race.ranksReady;
     if (race.ranks.isNotEmpty) {
       foContext.commitRanks(host, p, race.ranks);
     }
-    // Fix 9: if ranks are still empty (all probes timed out) we commit
-    // nothing rather than fake-latency data, keeping probed=false so the
-    // next TTL refresh triggers a real re-probe.
   }
 
   List<String> _rankedAttempts(
@@ -232,7 +227,15 @@ class FailoverTransportConnector implements ClientTransportConnector {
     );
     _socket = socket;
     try {
-      return await connectPinnedSocket(socket, hostname, port, options);
+      final connected = await connectPinnedSocket(
+        socket,
+        hostname,
+        port,
+        options,
+      );
+      // Track the final (possibly TLS) socket for done/shutdown.
+      _socket = connected.socket;
+      return connected.connection;
     } catch (_) {
       socket.destroy();
       _socket = null;

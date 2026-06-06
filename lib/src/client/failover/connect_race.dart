@@ -15,12 +15,18 @@ class TcpRaceResult {
   final int winnerRawMs;
   final List<IpRank> ranks;
 
+  /// Completes once [ranks] has been populated by the background drain.
+  /// Callers can await this instead of polling.
+  final Future<void> ranksReady;
+
   TcpRaceResult({
     required this.winnerSocket,
     required this.winnerAddr,
     required this.winnerRawMs,
     List<IpRank>? ranks,
-  }) : ranks = ranks ?? [];
+    Future<void>? ranksReady,
+  })  : ranks = ranks ?? [],
+        ranksReady = ranksReady ?? Future<void>.value();
 }
 
 /// Parallel TCP handshake race; first connect wins, losers are destroyed.
@@ -50,7 +56,7 @@ Future<TcpRaceResult?> tcpRace(
   }
 
   final timeout = config.connectTimeout;
-  final completer = Completer<TcpRaceResult?>();
+  final completer = Completer<_RaceWinner?>();
   final pending = <_RaceAttempt>[];
   var completed = false;
 
@@ -58,107 +64,90 @@ Future<TcpRaceResult?> tcpRace(
     final attempt = _RaceAttempt(addr: addr);
     pending.add(attempt);
     final stopwatch = Stopwatch()..start();
-    Socket.connect(InternetAddress(addr), port, timeout: timeout)
+
+    // Each attempt's [settled] future records its measured latency (or
+    // failure) exactly once, reusing the single race connect — no duplicate
+    // probing later.
+    attempt.settled = Socket.connect(InternetAddress(addr), port,
+        timeout: timeout)
         .then((socket) {
       stopwatch.stop();
-      if (completed) {
-        socket.destroy();
-        return;
-      }
-      completed = true;
-      for (final other in pending) {
-        if (other.addr != addr && other.socket != null) {
-          other.socket!.destroy();
-          other.socket = null;
+      attempt.latencyMs = stopwatch.elapsedMilliseconds;
+      if (!completed) {
+        completed = true;
+        attempt.socket = socket; // winner keeps its socket
+        if (!completer.isCompleted) {
+          completer.complete(_RaceWinner(socket, addr, attempt.latencyMs!));
         }
+      } else {
+        // Loser (or late winner after timeout): keep latency for ranking but
+        // close the socket — only the winner's socket is used to connect.
+        socket.destroy();
       }
-      attempt.socket = socket;
-      attempt.rawMs = stopwatch.elapsedMilliseconds;
-      if (!completer.isCompleted) {
-        completer.complete(
-          TcpRaceResult(
-            winnerSocket: socket,
-            winnerAddr: addr,
-            winnerRawMs: attempt.rawMs,
-            ranks: [],
-          ),
-        );
-      }
-    })
-        .catchError((_) {
+    }).catchError((Object _) {
       attempt.failed = true;
-      if (!completed && pending.every((a) => a.failed || a.socket != null)) {
+      if (!completed && pending.every((a) => a.failed)) {
+        completed = true;
         if (!completer.isCompleted) completer.complete(null);
       }
     });
   }
 
-  final result = await completer.future.timeout(
+  final winner = await completer.future.timeout(
     timeout + const Duration(milliseconds: 100),
     onTimeout: () {
-      if (!completed) {
-        for (final a in pending) {
-          a.socket?.destroy();
-        }
-      }
+      // Fix F: mark completed so any connect that wins *after* the timeout
+      // destroys its own socket instead of leaking it.
+      completed = true;
       return null;
     },
   );
 
-  if (result == null) return null;
+  if (winner == null) return null;
 
-  // Drain remaining connects in background to build full rank list.
-  unawaited(_drainAndBuildRanks(host, port, addrs, pending, config, result));
-
-  return result;
+  // Build the full rank list in the background by awaiting the already
+  // running connects (no extra connections), then expose readiness.
+  final result = TcpRaceResult(
+    winnerSocket: winner.socket,
+    winnerAddr: winner.addr,
+    winnerRawMs: winner.rawMs,
+    ranks: [],
+  );
+  final ranksReady =
+      _drainAndBuildRanks(host, port, pending, config, result);
+  return TcpRaceResult(
+    winnerSocket: winner.socket,
+    winnerAddr: winner.addr,
+    winnerRawMs: winner.rawMs,
+    ranks: result.ranks,
+    ranksReady: ranksReady,
+  );
 }
 
-/// Fix 8: probe remaining addresses in parallel (Future.wait) instead of
-/// sequentially, so that up to 16 addresses each capped at connectTimeout
-/// all resolve together rather than one-by-one.
+/// Awaits the in-flight race connects (no new connections) and fills
+/// [winnerResult.ranks] with the measured latency ranking.
 Future<void> _drainAndBuildRanks(
   String host,
   int port,
-  List<String> addrs,
   List<_RaceAttempt> pending,
   GrpcFoConfig config,
   TcpRaceResult winnerResult,
 ) async {
-  // Winner latency is already known.
-  final winnerRank = IpRank(
-    addr: winnerResult.winnerAddr,
-    bucketMs: roundBucket(winnerResult.winnerRawMs, config.latencyBucketMs),
-    rawMs: winnerResult.winnerRawMs,
-  );
+  // Wait for every connect to resolve or fail (they are already running).
+  await Future.wait(pending.map((a) => a.settled));
 
-  // Collect futures for all non-winner addresses in parallel.
-  final futures = <Future<IpRank?>>[];
-  for (final addr in addrs) {
-    if (addr == winnerResult.winnerAddr) continue;
-    final attempt = pending.firstWhere((a) => a.addr == addr);
-    if (attempt.failed) continue;
-    if (attempt.socket != null && attempt.rawMs > 0) {
-      // Already measured during the race.
-      futures.add(
-        Future.value(
-          IpRank(
-            addr: addr,
-            bucketMs: roundBucket(attempt.rawMs, config.latencyBucketMs),
-            rawMs: attempt.rawMs,
-          ),
+  final ranks = <IpRank>[];
+  for (final a in pending) {
+    final ms = a.latencyMs;
+    if (ms != null) {
+      ranks.add(
+        IpRank(
+          addr: a.addr,
+          bucketMs: roundBucket(ms, config.latencyBucketMs),
+          rawMs: ms,
         ),
       );
-    } else {
-      // In-flight or not-yet-connected: fire a fresh probe connect.
-      futures.add(_probeForRank(addr, port, config));
     }
-  }
-
-  final probeResults = await Future.wait(futures);
-
-  final ranks = <IpRank>[winnerRank];
-  for (final r in probeResults) {
-    if (r != null) ranks.add(r);
   }
 
   ranks.sort((a, b) => a.bucketMs.compareTo(b.bucketMs));
@@ -168,31 +157,6 @@ Future<void> _drainAndBuildRanks(
 
   if (config.verbose && winnerResult.ranks.isNotEmpty) {
     stderr.writeln('grpc_fo: race ranks committed for $host:$port');
-  }
-}
-
-Future<IpRank?> _probeForRank(
-  String addr,
-  int port,
-  GrpcFoConfig config,
-) async {
-  final stopwatch = Stopwatch()..start();
-  try {
-    final socket = await Socket.connect(
-      InternetAddress(addr),
-      port,
-      timeout: config.connectTimeout,
-    );
-    stopwatch.stop();
-    socket.destroy();
-    final rawMs = stopwatch.elapsedMilliseconds;
-    return IpRank(
-      addr: addr,
-      bucketMs: roundBucket(rawMs, config.latencyBucketMs),
-      rawMs: rawMs,
-    );
-  } catch (_) {
-    return null;
   }
 }
 
@@ -208,25 +172,22 @@ Future<Socket?> _connectOne(String addr, int port, Duration timeout) async {
   }
 }
 
+class _RaceWinner {
+  final Socket socket;
+  final String addr;
+  final int rawMs;
+
+  _RaceWinner(this.socket, this.addr, this.rawMs);
+}
+
 class _RaceAttempt {
   final String addr;
   Socket? socket;
-  int rawMs = 0;
+  int? latencyMs;
   bool failed = false;
+  Future<void> settled = Future<void>.value();
 
   _RaceAttempt({required this.addr});
-}
-
-/// Builds ranks from race drain results for cache commit.
-List<IpRank> buildRanksFromRace(
-  List<IpRank> ranks,
-  GrpcFoConfig config,
-) {
-  final copy = List<IpRank>.from(ranks);
-  copy.sort((a, b) => a.bucketMs.compareTo(b.bucketMs));
-  shuffleTied(copy, config.latencyBucketMs);
-  final n = copy.length < config.topIps ? copy.length : config.topIps;
-  return copy.sublist(0, n);
 }
 
 void unawaited(Future<void> future) {

@@ -16,7 +16,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:http2/transport.dart';
 
@@ -387,7 +386,15 @@ class SocketTransportConnector implements ClientTransportConnector {
         port,
         connectTimeout: _options.connectTimeout,
       );
-      return connectPinnedSocket(socket, _host, _port, _options);
+      final connected = await connectPinnedSocket(
+        socket,
+        _host,
+        _port,
+        _options,
+      );
+      // Track the final (possibly TLS) socket so done/shutdown are correct.
+      socket = connected.socket;
+      return connected.connection;
     }
 
     var incoming = await _connectImpl(proxy);

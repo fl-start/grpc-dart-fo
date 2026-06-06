@@ -21,8 +21,21 @@ Future<Socket> openTcpSocket(
   return Socket.connect(host, port, timeout: connectTimeout);
 }
 
-/// Upgrades [socket] to TLS when [credentials] require it; returns streams pair.
-Future<ClientTransportConnection> secureAndWrapTransport(
+/// An established transport plus the socket that actually backs it.
+///
+/// For TLS connections [socket] is the [SecureSocket] (not the raw TCP
+/// socket), so callers can correctly track `done` and call `destroy()`.
+/// After [SecureSocket.secure] the original raw socket must not be touched.
+class ConnectedTransport {
+  final ClientTransportConnection connection;
+  final Socket socket;
+
+  const ConnectedTransport(this.connection, this.socket);
+}
+
+/// Upgrades [socket] to TLS when [credentials] require it; returns the
+/// transport together with the final socket backing it.
+Future<ConnectedTransport> secureAndWrapTransport(
   Socket socket,
   ChannelOptions options, {
   required String tlsHost,
@@ -45,7 +58,10 @@ Future<ClientTransportConnection> secureAndWrapTransport(
     socket.setOption(SocketOption.tcpNoDelay, true);
   }
 
-  return ClientTransportConnection.viaStreams(incoming, socket);
+  return ConnectedTransport(
+    ClientTransportConnection.viaStreams(incoming, socket),
+    socket,
+  );
 }
 
 bool _validateBadCertificate(
@@ -154,7 +170,10 @@ void _waitForProxyResponse(Uint8List chunk, Completer<void> completer) {
 }
 
 /// Builds transport from an already-connected [socket] (failover IP pin path).
-Future<ClientTransportConnection> connectPinnedSocket(
+///
+/// Returns the [ConnectedTransport] so callers can track the final (possibly
+/// TLS-upgraded) socket for `done`/`shutdown`.
+Future<ConnectedTransport> connectPinnedSocket(
   Socket socket,
   Object logicalHost,
   int port,
