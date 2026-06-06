@@ -29,6 +29,7 @@ import 'connection.dart' hide ClientConnection;
 import 'connection.dart' as connection;
 import 'options.dart';
 import 'proxy.dart';
+import 'socket_transport.dart';
 import 'transport/http2_credentials.dart';
 import 'transport/http2_transport.dart';
 import 'transport/transport.dart';
@@ -380,74 +381,53 @@ class SocketTransportConnector implements ClientTransportConnector {
 
   @override
   Future<ClientTransportConnection> connect() async {
-    final securityContext = _options.credentials.securityContext;
-    var incoming = await connectImpl(proxy);
-
-    // Don't wait for io buffers to fill up before sending requests.
-    if (socket.address.type != InternetAddressType.unix) {
-      socket.setOption(SocketOption.tcpNoDelay, true);
+    if (proxy == null) {
+      socket = await openTcpSocket(
+        host,
+        port,
+        connectTimeout: _options.connectTimeout,
+      );
+      return connectPinnedSocket(socket, _host, _port, _options);
     }
+
+    var incoming = await _connectImpl(proxy);
+    final securityContext = _options.credentials.securityContext;
     if (securityContext != null) {
-      // Todo(sigurdm): We want to pass supportedProtocols: ['h2'].
-      // http://dartbug.com/37950
       socket = await SecureSocket.secure(
         socket,
-        // This is not really the host, but the authority to verify the TLC
-        // connection against.
-        //
-        // We don't use `this.authority` here, as that includes the port.
-        host: _options.credentials.authority ?? host,
+        host: tlsHostName(_host, _options),
         context: securityContext,
-        onBadCertificate: _validateBadCertificate,
+        onBadCertificate: (certificate) =>
+            _validateBadCertificate(certificate),
       );
       incoming = socket;
+    }
+    if (socket.address.type != InternetAddressType.unix) {
+      socket.setOption(SocketOption.tcpNoDelay, true);
     }
     return ClientTransportConnection.viaStreams(incoming, socket);
   }
 
-  Future<Stream<List<int>>> connectImpl(Proxy? proxy) async {
-    socket = await initSocket(host, port);
+  Future<Stream<List<int>>> _connectImpl(Proxy? proxy) async {
+    socket = await openTcpSocket(
+      host,
+      port,
+      connectTimeout: _options.connectTimeout,
+    );
     if (proxy == null) {
       return socket;
     }
-    return await connectToProxy(proxy);
+    return connectViaProxy(socket, _host, _port, proxy);
   }
 
-  Future<Socket> initSocket(Object host, int port) async {
-    return await Socket.connect(host, port, timeout: _options.connectTimeout);
-  }
-
-  void _sendConnect(Map<String, String> headers) {
-    const linebreak = '\r\n';
-    socket.write('CONNECT $_host:$_port HTTP/1.1');
-    socket.write(linebreak);
-    headers.forEach((key, value) {
-      socket.write('$key: $value');
-      socket.write(linebreak);
-    });
-    socket.write(linebreak);
+  bool _validateBadCertificate(X509Certificate certificate) {
+    final validator = _options.credentials.onBadCertificate;
+    if (validator == null) return false;
+    return validator(certificate, authority);
   }
 
   @override
-  String get authority {
-    return _options.credentials.authority ?? _makeAuthority();
-  }
-
-  String _makeAuthority() {
-    final host = _host;
-    final portSuffix = _port == 443 ? '' : ':$_port';
-    final String hostName;
-    if (host is String) {
-      hostName = host;
-    } else {
-      host as InternetAddress;
-      if (host.type == InternetAddressType.unix) {
-        return 'localhost'; // UDS don't have a meaningful authority.
-      }
-      hostName = host.host;
-    }
-    return '$hostName$portSuffix';
-  }
+  String get authority => makeAuthority(_host, _port, _options);
 
   @override
   Future get done {
@@ -459,61 +439,6 @@ class SocketTransportConnector implements ClientTransportConnector {
   void shutdown() {
     ArgumentError.checkNotNull(socket);
     socket.destroy();
-  }
-
-  bool _validateBadCertificate(X509Certificate certificate) {
-    final credentials = _options.credentials;
-    final validator = credentials.onBadCertificate;
-
-    if (validator == null) return false;
-    return validator(certificate, authority);
-  }
-
-  Future<Stream<List<int>>> connectToProxy(Proxy proxy) async {
-    final headers = {'Host': '$_host:$_port'};
-    if (proxy.isAuthenticated) {
-      // If the proxy configuration contains user information use that
-      // for proxy basic authorization.
-      final authStr = '${proxy.username}:${proxy.password}';
-      final auth = base64Encode(utf8.encode(authStr));
-      headers[HttpHeaders.proxyAuthorizationHeader] = 'Basic $auth';
-    }
-    final completer = Completer<void>();
-
-    /// Routes the events through after connection to the proxy has been
-    /// established.
-    final intermediate = StreamController<List<int>>();
-
-    /// Route events after the successfull connect to the `intermediate`.
-    socket.listen(
-      (event) {
-        if (completer.isCompleted) {
-          intermediate.sink.add(event);
-        } else {
-          _waitForResponse(event, completer);
-        }
-      },
-      onDone: intermediate.close,
-      onError: intermediate.addError,
-    );
-
-    _sendConnect(headers);
-    await completer.future;
-    return intermediate.stream;
-  }
-
-  /// Wait for the response to the `CONNECT` request, which should be an
-  /// acknowledgement with a 200 status code.
-  void _waitForResponse(Uint8List chunk, Completer<void> completer) {
-    final response = ascii.decode(chunk);
-    print(response);
-    if (response.startsWith('HTTP/1.1 200')) {
-      completer.complete();
-    } else {
-      throw TransportException(
-        'Error establishing proxy connection: $response',
-      );
-    }
   }
 }
 

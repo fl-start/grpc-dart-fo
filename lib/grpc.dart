@@ -27,6 +27,12 @@ export 'src/client/client_transport_connector.dart'
 export 'src/client/connection.dart' show ConnectionState;
 export 'src/client/http2_channel.dart'
     show ClientChannel, ClientTransportConnectorChannel;
+export 'src/client/failover/failover.dart'
+    show
+        GrpcFoConfig,
+        GrpcFoContext,
+        FailoverClientChannel,
+        FailoverTransportConnector;
 export 'src/client/interceptor.dart'
     show ClientInterceptor, ClientUnaryInvoker, ClientStreamingInvoker;
 export 'src/client/method.dart' show ClientMethod;
